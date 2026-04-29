@@ -31,7 +31,7 @@ jobs:
           pip install -r requirements.txt
           pip install tzdata
 
-            - name: Run local race notifier
+      - name: Run local race notifier
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
