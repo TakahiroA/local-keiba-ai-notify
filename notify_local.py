@@ -1,13 +1,13 @@
 import argparse
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from line_client import send_line_message
 from notify_db import already_notified, connect, save_notified
-from scraper import find_race_id, get_race_info
+from scraper import find_race_id, get_race_info, get_today_races
 from shobu_engine import build_line_text, evaluate_race, should_check_now
 
-# main.py の PLACES と同じ地方競馬場コード
 PLACES = {
     "30": "門別",
     "35": "盛岡",
@@ -28,7 +28,7 @@ PLACES = {
 
 
 def parse_races(s: str):
-    """'1-12' または '10,11,12' を list[int] に変換する。"""
+    """'1-12' or '10,11,12' -> list[int]."""
     s = str(s or "").strip()
 
     if "-" in s:
@@ -39,13 +39,87 @@ def parse_races(s: str):
 
 
 def normalize_places(value: str):
-    """'all' または '36,44,50' を地方競馬場コードの list[str] に変換する。"""
+    """'all' or '36,44,50' -> list[str] local racecourse codes."""
     value = str(value or "").strip()
 
     if value.lower() == "all":
         return list(PLACES.keys())
 
     return [p.strip().zfill(2) for p in value.split(",") if p.strip()]
+
+
+def has_start_time(race_info: dict) -> bool:
+    """Return True only if the race start time appears to be available."""
+    if race_info.get("start_time"):
+        return True
+
+    text = f"{race_info.get('name', '')} {race_info.get('info', '')}"
+    return bool(re.search(r"([0-2]?\d[:：][0-5]\d)", text))
+
+
+def build_race_info_for_time_check(race_id: str, schedule_item: dict, date: str) -> dict:
+    """Combine schedule-list info and detail-page info for time-window checks.
+
+    The heavy AI evaluation should only run when this function can confirm that
+    the race is inside the notification window.
+    """
+    race_info = {
+        "name": schedule_item.get("name", ""),
+        "info": schedule_item.get("info", ""),
+        "place_name": schedule_item.get("place_name", ""),
+        "start_time": schedule_item.get("start_time", ""),
+        "target_date": date,
+    }
+
+    detail = get_race_info(race_id)
+    if detail:
+        race_info["name"] = detail.get("name") or race_info.get("name", "")
+        race_info["info"] = " ".join(
+            [
+                str(race_info.get("info", "")),
+                str(detail.get("info", "")),
+            ]
+        ).strip()
+
+        for key, value in detail.items():
+            if key not in ["name", "info"] and value not in [None, ""]:
+                race_info[key] = value
+
+    race_info["target_date"] = date
+    return race_info
+
+
+def iter_target_races(date: str, place_codes, race_nos, use_schedule: bool):
+    """Yield candidate race dicts.
+
+    use_schedule=True:
+      Use the daily race list and only process real race_id values found there.
+
+    use_schedule=False:
+      Fallback to the old place x race_no method.
+    """
+    if use_schedule:
+        races = get_today_races(date, place_codes=place_codes, race_nos=race_nos)
+        for race in races:
+            yield race
+        return
+
+    for place in place_codes:
+        for race_no in race_nos:
+            race_id = find_race_id(date, place, race_no)
+            if not race_id:
+                print(f"SKIP {date} {PLACES.get(place, place)}{race_no}R: race_idが見つかりません")
+                continue
+
+            yield {
+                "race_id": race_id,
+                "place": place,
+                "place_name": PLACES.get(place, place),
+                "race_no": race_no,
+                "name": "",
+                "info": "",
+                "start_time": "",
+            }
 
 
 def main():
@@ -58,7 +132,7 @@ def main():
     )
     parser.add_argument(
         "--places",
-        default="44,50,54",
+        default="all",
         help="地方競馬場コード。例: 44,50,54 / all",
     )
     parser.add_argument(
@@ -94,78 +168,106 @@ def main():
         action="store_true",
         help="LINE送信せず表示だけ",
     )
+    parser.add_argument(
+        "--no-schedule",
+        action="store_true",
+        help="開催一覧を使わず、従来通りplace×raceで確認する",
+    )
 
     args = parser.parse_args()
 
     date = args.date.replace("-", "")
     place_codes = normalize_places(args.places)
-    races = parse_races(args.races)
+    race_nos = parse_races(args.races)
+    use_schedule = not args.no_schedule
 
     conn = connect()
 
-    for place in place_codes:
-        place_name = PLACES.get(place, place)
+    checked = 0
+    no_time_skipped = 0
+    time_skipped = 0
+    heavy_checked = 0
+    sent = 0
 
-        for race_no in races:
-            race_id = None
+    for item in iter_target_races(date, place_codes, race_nos, use_schedule=use_schedule):
+        checked += 1
 
-            try:
-                # まず race_id を決める
-                race_id = find_race_id(date, place, race_no)
+        race_id = item.get("race_id")
+        place = item.get("place") or str(race_id)[4:6]
+        place_name = item.get("place_name") or PLACES.get(place, place)
 
-                if not race_id:
-                    print(f"SKIP {date} {place_name}{race_no}R: race_idが見つかりません")
-                    continue
+        try:
+            race_no = item.get("race_no") or int(str(race_id)[-2:])
+        except Exception:
+            race_no = 0
 
-                # ここが重要:
-                # 先に軽いレース情報だけ取得して、発走20〜40分前かを見る。
-                # 時間外なら、出馬表・オッズ・全馬過去走の重い処理はしない。
-                race_info = get_race_info(race_id)
-                race_info["target_date"] = date
+        try:
+            # Light step: get race info/time only.
+            race_info = build_race_info_for_time_check(race_id, item, date)
 
-                if not should_check_now(
-                    race_info,
-                    date,
-                    from_min=args.from_min,
-                    to_min=args.to_min,
-                ):
-                    print(f"SKIP TIME {race_id}: {place_name}{race_no}R 通知時間外")
-                    continue
+            # Priority 1: if start time cannot be parsed, do not run heavy evaluation.
+            if not has_start_time(race_info):
+                no_time_skipped += 1
+                print(f"SKIP NO TIME {race_id}: {place_name}{race_no}R 発走時刻を取得できません")
+                continue
 
-                # 発走時間が対象範囲内のレースだけ、重いAI判定を実行する
-                result = evaluate_race(race_id, date, args.budget)
+            # Only races inside the window go to heavy evaluation.
+            if not should_check_now(
+                race_info,
+                date,
+                from_min=args.from_min,
+                to_min=args.to_min,
+            ):
+                time_skipped += 1
+                print(f"SKIP TIME {race_id}: {place_name}{race_no}R 通知時間外")
+                continue
 
-                if result.mode not in ["official", "light"]:
-                    print(f"SKIP {race_id}: {result.title} / {result.reason}")
-                    continue
+            heavy_checked += 1
 
-                if result.mode == "light" and not args.include_light:
-                    print(f"SKIP LIGHT {race_id}: 軽め勝負は通知対象外")
-                    continue
+            # Heavy step: shutuba, odds, past runs, AI judgment.
+            result = evaluate_race(race_id, date, args.budget)
 
-                if already_notified(conn, result.notify_key):
-                    print(f"SKIP DUP {race_id}: 通知済み")
-                    continue
+            if result.mode not in ["official", "light"]:
+                print(f"SKIP {race_id}: {result.title} / {result.reason}")
+                continue
 
-                text = build_line_text(result, label=f"地方 {place_name}")
+            if result.mode == "light" and not args.include_light:
+                print(f"SKIP LIGHT {race_id}: 軽め勝負は通知対象外")
+                continue
 
-                if args.dry_run:
-                    print("----- DRY RUN -----")
-                    print(text)
-                else:
-                    send_line_message(text)
-                    save_notified(
-                        conn,
-                        key=result.notify_key,
-                        race_id=race_id,
-                        mode=result.mode,
-                        title=result.title,
-                        axis=f"{result.axis_num} {result.axis_name}",
-                    )
-                    print(f"SENT {race_id}: {result.title}")
+            if already_notified(conn, result.notify_key):
+                print(f"SKIP DUP {race_id}: 通知済み")
+                continue
 
-            except Exception as e:
-                print(f"ERROR place={place} race={race_no} race_id={race_id}: {e}")
+            text = build_line_text(result, label=f"地方 {place_name}")
+
+            if args.dry_run:
+                print("----- DRY RUN -----")
+                print(text)
+            else:
+                send_line_message(text)
+                save_notified(
+                    conn,
+                    key=result.notify_key,
+                    race_id=race_id,
+                    mode=result.mode,
+                    title=result.title,
+                    axis=f"{result.axis_num} {result.axis_name}",
+                )
+                sent += 1
+                print(f"SENT {race_id}: {result.title}")
+
+        except Exception as e:
+            print(f"ERROR place={place} race={race_no} race_id={race_id}: {e}")
+
+    print(
+        "SUMMARY "
+        f"checked={checked} "
+        f"no_time_skipped={no_time_skipped} "
+        f"time_skipped={time_skipped} "
+        f"heavy_checked={heavy_checked} "
+        f"sent={sent}"
+    )
 
 
 if __name__ == "__main__":

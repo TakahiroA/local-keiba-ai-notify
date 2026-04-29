@@ -377,6 +377,246 @@ def get_race_info(race_id: str) -> dict:
     }
 
 
+def parse_race_no_from_race_id(race_id: str) -> int:
+    try:
+        return int(str(race_id)[-2:])
+    except Exception:
+        return 0
+
+
+def extract_start_time_text(text: str) -> str:
+    """ページや一覧周辺テキストから発走時刻らしき HH:MM を拾う。"""
+    text = str(text or "")
+    patterns = [
+        r"発走\s*([0-2]?\d[:：][0-5]\d)",
+        r"締切\s*([0-2]?\d[:：][0-5]\d)",
+        r"([0-2]?\d[:：][0-5]\d)\s*発走",
+        r"([0-2]?\d[:：][0-5]\d)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).replace("：", ":")
+    return ""
+
+
+PLACE_CODE_TO_NAME = {
+    "30": "門別",
+    "35": "盛岡",
+    "36": "水沢",
+    "42": "浦和",
+    "43": "船橋",
+    "44": "大井",
+    "45": "川崎",
+    "46": "金沢",
+    "47": "笠松",
+    "48": "名古屋",
+    "50": "園田",
+    "51": "姫路",
+    "54": "高知",
+    "55": "佐賀",
+    "65": "帯広ば",
+}
+
+PLACE_NAME_TO_CODE = {v: k for k, v in PLACE_CODE_TO_NAME.items()}
+PLACE_NAME_TO_CODE.update({
+    "帯広": "65",
+    "ばんえい": "65",
+})
+
+
+def extract_active_places_from_tabs(soup: BeautifulSoup, place_set=None) -> set:
+    """開催一覧ページのタブ名から開催場コードを拾う。
+
+    netkeibaの地方開催一覧は、初期表示の場だけ race_id リンクがHTMLに出て、
+    他場はタブ名だけ見えていることがある。
+    その場合、a[href*='race_id='] だけでは笠松などを取りこぼすため、
+    短いテキストのタブ/ボタン/リンクから場名を拾う。
+    """
+    active = set()
+    if soup is None:
+        return active
+
+    selectors = [
+        "a", "li", "button", "span", "div", "dt", "dd",
+        "[class*='Tab']", "[class*='tab']", "[class*='RaceList']",
+    ]
+
+    seen_tags = []
+    for sel in selectors:
+        try:
+            for tag in soup.select(sel):
+                if tag not in seen_tags:
+                    seen_tags.append(tag)
+        except Exception:
+            pass
+
+    for tag in seen_tags:
+        text = tag.get_text(" ", strip=True)
+        if not text:
+            continue
+
+        compact = re.sub(r"\s+", "", text)
+        compact = compact.replace("競馬", "").replace("TOP", "")
+        compact = compact.strip("｜|/・-　 ")
+
+        for name, code in PLACE_NAME_TO_CODE.items():
+            if place_set and code not in place_set:
+                continue
+
+            if compact == name:
+                active.add(code)
+                continue
+
+            # タブが一塊で「門別大井笠松園田」のように取れる場合の保険。
+            # ページ全体の巨大テキストから誤検出しないよう短い文字列だけ許可。
+            if len(compact) <= 30 and name in compact:
+                active.add(code)
+
+    return active
+
+
+def get_today_races(date: str, place_codes=None, race_nos=None) -> List[dict]:
+    """地方netkeibaの開催一覧から「今日開催している場」を拾い、その場の対象Rを返す。
+
+    active_places は次の2系統を合算して作る。
+    1. race_idリンクから拾える開催場
+    2. 開催一覧ページのタブ名から拾える開催場
+
+    開催一覧ページでは、初期表示中の場だけ race_id リンクが出て、
+    他場はタブ名だけHTMLに出ることがある。
+    タブ名も見ることで、笠松などの取りこぼしを減らす。
+    """
+    date = str(date or "").replace("-", "")
+    place_set = {str(p).zfill(2) for p in place_codes} if place_codes else None
+    race_no_list = sorted({int(r) for r in race_nos}) if race_nos else list(range(1, 13))
+    race_no_set = set(race_no_list)
+
+    urls = [
+        f"{NAR_BASE_URL}/top/race_list.html?kaisai_date={date}",
+        f"{NAR_SP_BASE_URL}/top/race_list.html?kaisai_date={date}",
+        f"{NAR_BASE_URL}/top/?kaisai_date={date}",
+    ]
+
+    found_by_race_id = {}
+    active_places = set()
+    active_places_from_links = set()
+    active_places_from_tabs = set()
+
+    for url in urls:
+        soup = fetch(url, retry=1, selenium_fallback=True)
+        if soup is None:
+            continue
+
+        tab_places = extract_active_places_from_tabs(soup, place_set=place_set)
+        active_places_from_tabs.update(tab_places)
+        active_places.update(tab_places)
+
+        for a in soup.select("a[href*='race_id=']"):
+            href = a.get("href", "")
+            m = re.search(r"race_id=(\d{12})", href)
+            if not m:
+                continue
+
+            race_id = m.group(1)
+            place = race_id[4:6]
+            race_no = parse_race_no_from_race_id(race_id)
+
+            if place_set and place not in place_set:
+                continue
+
+            active_places.add(place)
+            active_places_from_links.add(place)
+
+            if race_no_set and race_no not in race_no_set:
+                continue
+
+            container = a
+            container_texts = []
+            for _ in range(5):
+                if container is None:
+                    break
+                try:
+                    container_texts.append(container.get_text(" ", strip=True))
+                except Exception:
+                    pass
+                container = container.parent
+
+            around_text = " ".join(container_texts)
+            start_time = extract_start_time_text(around_text)
+            title = clean_name(a.get_text(" ", strip=True))
+
+            item = {
+                "race_id": race_id,
+                "place": place,
+                "place_name": extract_place_from_race_id(race_id),
+                "race_no": race_no,
+                "name": title,
+                "info": around_text,
+                "start_time": start_time,
+                "source": "race_list",
+            }
+
+            if race_id not in found_by_race_id:
+                found_by_race_id[race_id] = item
+            else:
+                old = found_by_race_id[race_id]
+                if not old.get("start_time") and start_time:
+                    old["start_time"] = start_time
+                if not old.get("info") and around_text:
+                    old["info"] = around_text
+                if not old.get("name") and title:
+                    old["name"] = title
+
+    out = []
+    for place in sorted(active_places):
+        for race_no in race_no_list:
+            race_id = race_id_from_date_place(date, place, race_no)
+
+            if race_id in found_by_race_id:
+                out.append(found_by_race_id[race_id])
+            else:
+                source = "expanded_active_place"
+                if place in active_places_from_tabs and place not in active_places_from_links:
+                    source = "expanded_tab_place"
+
+                out.append({
+                    "race_id": race_id,
+                    "place": place,
+                    "place_name": extract_place_from_race_id(race_id),
+                    "race_no": race_no,
+                    "name": "",
+                    "info": "",
+                    "start_time": "",
+                    "source": source,
+                })
+
+    out.sort(key=lambda r: (r.get("place", ""), r.get("race_no", 0)))
+
+    def names(codes):
+        return [f"{c}:{PLACE_CODE_TO_NAME.get(c, c)}" for c in sorted(codes)]
+
+    print(
+        "開催一覧取得:",
+        f"active_places={len(active_places)}",
+        f"from_links={names(active_places_from_links)}",
+        f"from_tabs={names(active_places_from_tabs)}",
+        f"listed_races={len(found_by_race_id)}",
+        f"expanded_races={len(out)}",
+        [
+            (
+                r.get("race_id"),
+                r.get("place_name"),
+                r.get("race_no"),
+                r.get("start_time"),
+                r.get("source"),
+            )
+            for r in out
+        ],
+    )
+
+    return out
+
 def extract_horse_number(cols, row) -> str:
     tag = row.select_one(".Umaban, [class*='Umaban'], .HorseNumber, [class*='HorseNumber']")
     if tag:
