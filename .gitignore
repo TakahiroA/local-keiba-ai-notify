@@ -1,0 +1,7 @@
+﻿__pycache__/
+*.pyc
+.env
+notified_races.db
+notified_races.sqlite
+logs/
+.venv/
